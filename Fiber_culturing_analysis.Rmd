@@ -1,0 +1,1106 @@
+---
+title: "Fiber_culturing_analysis"
+author: "Julio Avelar-Barragan"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load libraries and input files.  
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(vegan)
+library(ggpubr)
+library(Maaslin2)
+library(RColorBrewer)
+library(nlme)
+library(Hmisc)
+
+options(scipen=999)
+
+setwd("/media/julio/Storage/Big_boy_fiber_culturing/")
+
+metadata = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/metadata.tsv")
+OTU_table = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/OTU_table.tsv", check.names = F, row.names = 1)
+Read_counts_per_sample = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/Reads_per_sample.txt", check.names = F, header = F, sep = " ")
+#Don't forget to import MAG completeness/contamination.  
+```
+
+Read counts.  
+```{r}
+Raw_read_counts <- read.table("Raw_read_counts.txt", quote="\"", comment.char="")
+QF_read_counts <- read.table("QF_read_counts.txt", quote="\"", comment.char="")
+DD_read_counts <- read.table("DD_read_counts.txt", quote="\"", comment.char="")
+DC_read_counts <- read.table("DD_read_counts.txt", quote="\"", comment.char="")
+
+Read_counts_all = merge(Raw_read_counts, QF_read_counts, by = "V1") %>% 
+  merge(., DD_read_counts, by = "V1") %>% merge(., DC_read_counts, by = "V1")
+
+names(Read_counts_all) = c("SampleID", "Raw", "Quality filtered", "Deduplicated", "Decontaminated")
+
+RC_plot_df = reshape2::melt(Read_counts_all)
+
+grp.means = RC_plot_df %>% group_by(variable) %>% summarise(means = mean(value))
+grp.means$sd = RC_plot_df %>% group_by(variable) %>% summarise(sd = sd(value))
+
+ggplot(data = RC_plot_df) +
+  aes(x = value, fill = variable) + 
+  geom_vline(data=grp.means, aes(xintercept=means, color=variable), linetype="dashed") +
+  geom_histogram(position = "identity", alpha = 0.5, color = "black") + 
+  theme_bw() +
+  labs(title = "Read counts/Sample", x = NULL, y = "Count", fill = "QC Step") + 
+  guides(color = "none") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(data = RC_plot_df) +
+  aes(x = variable, y = value) +
+  geom_boxplot()
+```
+
+MAGs with >50% completeness and <10% contamination were included.  
+What % of reads mapped to the 297 MAGs?  
+Note: The read counts in the OTU table are doubled (because of paired end) so you need to divide the reads/sample by two.  
+```{r}
+Num_of_mapped_reads = as_tibble(colSums(OTU_table)/2) %>% mutate(SampleID = colnames(OTU_table)) %>% merge(x = ., y = Read_counts_per_sample, by.x = "SampleID", by.y = "V1") %>% mutate(Percent_mapped = (value/V2)*100) %>% merge(., metadata, by.x = "SampleID", by.y = "Row.names")
+
+MAG_plot = ggplot(data = Num_of_mapped_reads[!Num_of_mapped_reads$SampleID == "UNLABLED",]) +
+  aes(x = Country, y = Percent_mapped) +
+  theme_bw() +
+  labs(x = NULL, y = "Percentage (%)", title = "Percentage of MAG-mapped reads per sample") +
+  geom_jitter(alpha = 0.25) +
+  geom_boxplot(outlier.shape = NA, color = "hotpink", fill = NA, lwd = 1)
+```
+Seems like there is comparable mapping against Moroccan and US samples.  
+
+'Rarefaction' Curve.  
+```{r}
+rarecurve(t(OTU_table), sample = 100000, step = 10000, label = F, xlab = "Read Depth", col = "orange", xlim=c(0, 200000))
+```
+Looks like a good idea to toss samples which had less than 100k mapped reads.  
+
+It is 200k because of the PE doubling.  
+```{r}
+OTU_clean = OTU_table[,!colSums(OTU_table) < 200000] %>% t(.) %>% as.data.frame(.)
+OTU_clean = round(OTU_clean/2) #No longer doubled
+```
+
+Alpha diversity.  
+```{r}
+alpha_df = as.data.frame(diversity(x = OTU_clean)) %>% merge(., y = metadata, by.x = "row.names", by.y = "Row.names") %>% rename(Shannon = `diversity(x = OTU_clean)`)
+```
+Ran richness through the specnumber function too but it wasn't useful because most samples have at least one read mapping to each MAG.  
+
+```{r}
+alpha_df = alpha_df %>% filter(!(Fiber %in% c("INULIN", "PECTIN", "PSYLLIUM") & Time == "0"), !Row.names == "M03-24", !Fiber == "CTRL")
+alpha_df$Fiber = factor(alpha_df$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM", "CTRL"))
+
+Shannon_plot = ggplot(data = alpha_df) +
+  aes(x = Fiber, y = Shannon, fill = Country) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_grid(.~Time, scales = "free", space = "free") +
+  geom_point(position = position_jitterdodge(jitter.width = .1), alpha = 0.5) +
+  scale_fill_manual(values = c("#BF0D3E", "steelblue")) +
+  #geom_text(label = alpha_df$Row.names, position = position_jitterdodge(jitter.width = .1)) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill="white")) +
+  labs(x = NULL, y = "Shannon Diversity", title = "Taxonomic diversity")
+
+#ggsave(filename = "Figure2.png", plot = ggarrange(MAG_plot, Shannon_plot, nrow = 1, widths = c(1,2), labels = c("a.", "b.")), device = "png", width = 10, height = 5, dpi = 600)
+
+#Linear model
+alpha_lm <- NULL
+alpha_lm$x <- as.numeric(alpha_df$Shannon)
+alpha_lm$c <- as.factor(alpha_df$Country)
+alpha_lm$s <- as.factor(alpha_df$Subject)
+alpha_lm$t <- as.factor(alpha_df$Time)
+alpha_lm$f <- as.factor(alpha_df$Fiber)
+alpha_lm <- as.data.frame(alpha_lm)
+alpha_lm <- within(alpha_lm, f <- relevel(f, "NONE"))
+
+alpha_lm = alpha_lm %>% group_by(s, t, f, c) %>% summarise(x = mean(x)) 
+
+summary(lme(x ~ c, data = alpha_lm[alpha_lm$t == 0,], random = list(s=~1))) #p = 0.04 for countries having significantly different shannon diversities between countries at T0
+
+summary(lme(x ~ f, data = alpha_lm[alpha_lm$t == 24 & alpha_lm$c == "US",], random = list(s=~1))) #Inulin is significantly decreased in the US, pectin is marginally
+summary(lme(x ~ f, data = alpha_lm[alpha_lm$t == 24 & alpha_lm$c == "Morocco",], random = list(s=~1))) #Pectin is marginally richer (p = <.1)
+
+```
+
+Samples cultured from US fecal samples are more diverse when compared to Moroccan samples.  
+In this case, I'm not sure more diversity is better since you are adding an extra carbohydrate source so maybe samples with less diversity enrich for a particular microbe and are thus more successful.  
+That doesn't explain why even with no fiber added, Moroccan samples are less diverse at T24.  
+Maybe BHI is better at maintaining the community composition in US samples compared to Moroccan ones.  
+
+Average genome size
+```{r}
+avg_genome_size = read.table("Avg_genome_size.txt", quote="\"", comment.char="") %>% merge(., y = metadata, by.x = "V1", by.y = "Row.names")  %>% filter(V1 %in% alpha_df$Row.names)
+avg_genome_size$Fiber = factor(avg_genome_size$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM", "CTRL"))
+
+genome_size_plot = ggplot(data = avg_genome_size) +
+  aes(x = Fiber, y = V2, fill = Country) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_grid(.~Time, scales = "free", space = "free") +
+  geom_point(position = position_jitterdodge(jitter.width = .1), alpha = 0.5) +
+  scale_fill_manual(values = c("#BF0D3E", "steelblue")) +
+  #geom_text(label = alpha_df$Row.names, position = position_jitterdodge(jitter.width = .1)) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill="white")) +
+  labs(x = NULL, y = "Bases", title = "Average genome size")
+genome_size_plot
+
+#Linear model
+genome_lm <- NULL
+genome_lm$x <- as.numeric(avg_genome_size$V2)
+genome_lm$c <- as.factor(avg_genome_size$Country)
+genome_lm$s <- as.factor(avg_genome_size$Subject)
+genome_lm$t <- as.factor(avg_genome_size$Time)
+genome_lm$f <- as.factor(avg_genome_size$Fiber)
+genome_lm <- as.data.frame(genome_lm)
+
+genome_lm <- within(genome_lm, f <- relevel(f, "NONE"))
+
+genome_lm = genome_lm %>% group_by(s, t, f, c) %>% summarise(x = mean(x)) 
+
+summary(lme(x ~ c, data = genome_lm[genome_lm$t == 0,], random = list(s=~1))) #Super significant, less that 2e-17
+```
+
+Beta diversity
+```{r beta}
+OTU_clean_merged = OTU_clean %>% filter(rownames(.) %in% alpha_df$Row.names) %>% merge(metadata, ., by.x = "Row.names", by.y = "row.names")
+
+#T0
+T0_nmds = OTU_clean_merged %>% filter(Time == 0) %>% column_to_rownames(var = "Row.names") %>% select(bin_1:ncol(.)) %>% metaMDS(comm = ., trymax = 1024, parallel = 32, k = 2)
+T0_points = T0_nmds$points %>% merge(., metadata, by.x = "row.names", by.y = "Row.names") %>% unite("Country_Time", Country, Time, remove = F)
+T0_points$Fiber = factor(T0_points$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM", "CTRL"))
+
+Fig2b = ggplot(data = T0_points) +
+  aes(x = MDS1, y = MDS2) +
+  stat_ellipse(aes(mapping = Country_Time, color = Country_Time), alpha = 0.5, lty = 2) +
+  geom_point(aes(fill = Country), pch = 21, color = "black", size = 5, alpha = 0.5) +
+  #geom_text(label = T0_points$Subject, color = "black", size = 2.5, alpha = 0.7) +
+  scale_shape_manual(values = c(21,23)) +
+  scale_fill_manual(values = c("#BF0D3E", "steelblue")) +
+  scale_color_manual(values = c("#BF0D3E", "steelblue")) +
+  guides(color = "none", fill = guide_legend(override.aes = list(shape = 21))) +
+  theme_bw() +
+  labs(title = "Taxonomy", subtitle = "T0 only") +
+  annotate("text", x = .5, y = .325, label = bquote("Stress ="~.(round(T0_nmds$stress, digits = 2))), hjust = 1) +
+  annotate("text", x = .5, y = .275, label = "k = 2", hjust = 1)
+
+#T24
+T24_nmds = OTU_clean_merged %>% filter(Time == 24) %>% column_to_rownames(var = "Row.names") %>% select(bin_1:ncol(.)) %>% metaMDS(comm = ., trymax = 1024, parallel = 32, k = 3)
+T24_points = T24_nmds$points %>% merge(., metadata, by.x = "row.names", by.y = "Row.names") %>% unite("Country_Fiber", Country, Fiber, remove = F)
+T24_points$Fiber = factor(T24_points$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM", "CTRL"))
+
+Fig2c = ggplot(data = T24_points) +
+  aes(x = MDS1, y = MDS2) +
+  stat_ellipse(aes(mapping = Country_Fiber, color = Country_Fiber), alpha = 0.5, lty = 2) +
+  geom_point(aes(fill = Fiber, pch = Country), color = "black", size = 5, alpha = 0.5) +
+  #geom_text(label = T24_points$Subject, color = "black", size = 2.5, alpha = 0.7) +
+  scale_shape_manual(values = c(21,23)) +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_manual(values = c("#d95f02","#1b9e77", "#7570b3", "#e7298a", "#d95f02", "#1b9e77", "#7570b3", "#e7298a")) +
+  guides(color = "none", fill = guide_legend(override.aes = list(shape = 21))) +
+  theme_bw() +
+  labs(title = "Taxonomy", subtitle = "T24 only") +
+  annotate("text", x = .3, y = .4, label = bquote("Stress ="~.(round(T24_nmds$stress, digits = 2))), hjust = 1) +
+  annotate("text", x = .3, y = .35, label = "k = 3", hjust = 1)
+
+#Both together
+beta_nmds = OTU_clean_merged %>% column_to_rownames(var = "Row.names") %>% select(bin_1:ncol(.)) %>% metaMDS(comm = ., trymax = 1024, parallel = 32, k = 3)
+nmds_df = beta_nmds$points %>% merge(., metadata, by.x = "row.names", by.y = "Row.names") %>% unite("Country_Time", Country, Time, remove = F)
+nmds_df$Fiber = factor(nmds_df$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM", "CTRL"))
+
+ggplot(data = nmds_df) +
+  aes(x = MDS1, y = MDS2) +
+  stat_ellipse(aes(mapping = Country_Time, color = Country_Time), alpha = 0.5, lty = 2) +
+  geom_point(aes(pch = Time, fill = Country), color = "black", size = 5, alpha = 0.5) +
+  #geom_text(label = nmds_df$Subject, color = "black", size = 2.5, alpha = 0.7) +
+  scale_shape_manual(values = c(21,23)) +
+  scale_fill_manual(values = c("#BF0D3E", "steelblue")) +
+  scale_color_manual(values = c("#BF0D3E", "#BF0D3E", "steelblue", "steelblue")) +
+  guides(color = "none", fill = guide_legend(override.aes = list(shape = 21))) +
+  theme_bw() +
+  labs(title = "MAG - Bray-Curtis") +
+  annotate("text", x = .5, y = .4, label = bquote("Stress ="~.(round(beta_nmds$stress, digits = 2))), hjust = 1) +
+  annotate("text", x = .5, y = .35, label = "k = 3", hjust = 1)
+```
+
+```{r}
+#nmds_df = nmds_df %>% unite("Fiber_Time", Fiber, Time, remove = F)
+
+ggplot(data = nmds_df) +
+  aes(x = MDS1, y = MDS2) +
+  stat_ellipse(aes(mapping = Fiber, color = Fiber), alpha = 0.5, lty = 2) +
+  geom_point(aes(pch = Time, fill = Fiber), color = "black", size = 5, alpha = 0.5) +
+  #geom_text(label = nmds_df$Subject, color = "black", size = 2.5, alpha = 0.7) +
+  scale_shape_manual(values = c(21,23)) +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_brewer(palette = "Dark2") +
+  guides(color = "none", fill = guide_legend(override.aes = list(shape = 21))) +
+  theme_bw() +
+  labs(title = "MAG - Bray-Curtis") +
+  annotate("text", x = .7, y = .45, label = bquote("Stress ="~.(round(beta_nmds$stress, digits = 2))), hjust = 1) +
+  annotate("text", x = .7, y = .4, label = "k = 3", hjust = 1)
+
+#ggsave(filename = "Figure3.png", plot =  ggarrange(Fig3a, Fig3b, ncol = 1, labels = c("a.", "b.")), device = "png", dpi = 600, width = 8, height = 9)
+```
+
+Permanovas
+```{r}
+#Both together
+perma_out1 = adonis2(formula = OTU_clean_merged[,7:ncol(OTU_clean_merged)] ~ Country / Subject / Fiber, data = OTU_clean_merged, permutations = 999, method = "bray", parallel = 32, strata = OTU_clean_merged$Time)
+
+#T0
+T0_OTU = OTU_clean_merged %>% filter(Time == 0)
+perma_out2 = adonis2(formula = T0_OTU[,7:ncol(T0_OTU)] ~ Country / Subject, data = T0_OTU, permutations = 999, method = "bray", parallel = 32)
+
+#T24
+T24_OTU = OTU_clean_merged %>% filter(Time == 24)
+perma_out3 = adonis2(formula = T24_OTU[,7:ncol(T24_OTU)] ~ Country / Subject / Fiber, data = T24_OTU, permutations = 999, method = "bray", parallel = 32)
+
+#T24, separate cohorts 
+US_T24_OTU = T24_OTU %>% filter(Country == "US")
+perma_out4 = adonis2(formula = US_T24_OTU[,7:ncol(US_T24_OTU)] ~ Subject / Fiber, data = US_T24_OTU, permutations = 999, method = "bray", parallel = 32)
+
+MO_T24_OTU = T24_OTU %>% filter(Country == "Morocco")
+perma_out5 = adonis2(formula = MO_T24_OTU[,7:ncol(MO_T24_OTU)] ~ Subject / Fiber, data = MO_T24_OTU, permutations = 999, method = "bray", parallel = 32)
+```
+
+Beta-dispersion
+```{r}
+bray = OTU_clean_merged %>% column_to_rownames(var = "Row.names") %>% select(!Fiber:Country) %>% vegdist(x = ., method = "bray")
+bray_merged = merge(metadata, as.matrix(bray), by.x = "Row.names", by.y = "row.names") %>% unite("All", Country, Time, Fiber, remove = F)
+
+bdisper = betadisper(bray, group = bray_merged$All, bias.adjust = FALSE, sqrt.dist = FALSE, add = FALSE)
+bdisper_merged = as.data.frame(bdisper$distances) %>% merge(., metadata, by.x = "row.names", by.y = "Row.names")
+
+ggplot(data = bdisper_merged) +
+  aes(x = Fiber, y = bdisper_merged$`bdisper$distances`, fill = Country) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_grid(.~Time, scales = "free", space = "free") +
+  geom_point(position = position_jitterdodge(jitter.width = .1), alpha = 0.5) +
+  scale_fill_manual(values = c("#BF0D3E", "steelblue")) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill="white")) +
+  labs(x = NULL, y = "Beta-dispersion")
+```
+Moroccan samples have lower beta-dispersion values for each condition at T24, which supports tighter clustering on the NMDS.  
+Interestingly, Moroccan samples have higher variances which means some points were really close to all the others and some were really far, but on average they were less dispersed than US samples at T24.  
+
+Differential abundance analysis using Maaslin2.  
+```{r}
+OTU_merged_T0 = OTU_clean_merged %>% filter(Time == 0, Country %in% c("US", "Morocco")) %>% column_to_rownames(var = "Row.names")
+OTU_merged_T0[,6:ncol(OTU_merged_T0)] = decostand(OTU_merged_T0[,6:ncol(OTU_merged_T0)], method = "total", MARGIN = 1)
+OTU_merged_T0 = OTU_merged_T0 %>% unite(col = "AverageID", Subject, Country, remove = F) %>% remove_rownames() %>% select(!c("Fiber","Cohort")) %>% group_by(AverageID) %>% summarise(across(bin_1:(ncol(.)-1), mean)) %>% tidyr::separate(., col = AverageID, into = c("Subject", "Country"), sep = "_", remove = F, extra = "warn") %>% column_to_rownames(var = "AverageID")
+
+OTU_merged_T24 = OTU_clean_merged %>% filter(Time == 24, Country %in% c("US", "Morocco")) %>% column_to_rownames(var = "Row.names")
+OTU_merged_T24[,6:ncol(OTU_merged_T24)] = decostand(OTU_merged_T24[,6:ncol(OTU_merged_T24)], method = "total", MARGIN = 1)
+OTU_merged_T24 = OTU_merged_T24 %>% unite(col = "AverageID", Subject, Fiber, remove = F) %>% remove_rownames() %>% select(!c("Country","Cohort")) %>% group_by(AverageID) %>% summarise(across(bin_1:(ncol(.)-1), mean)) %>% tidyr::separate(., col = AverageID, into = c("Subject", "Fiber"), sep = "_", remove = F, extra = "warn") %>% column_to_rownames(var = "AverageID")
+OTU_merged_T24$Fiber = factor(OTU_merged_T24$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM"))
+
+OTU_merged_T24_US = OTU_clean_merged %>% filter(Time == 24, Country == "US") %>% column_to_rownames(var = "Row.names")
+OTU_merged_T24_US[,6:ncol(OTU_merged_T24_US)] = decostand(OTU_merged_T24_US[,6:ncol(OTU_merged_T24_US)], method = "total", MARGIN = 1)
+OTU_merged_T24_US = OTU_merged_T24_US %>% unite(col = "AverageID", Subject, Fiber, remove = F) %>% remove_rownames() %>% select(!c("Country","Cohort")) %>% group_by(AverageID) %>% summarise(across(bin_1:(ncol(.)-1), mean)) %>% tidyr::separate(., col = AverageID, into = c("Subject", "Fiber"), sep = "_", remove = F, extra = "warn") %>% column_to_rownames(var = "AverageID")
+OTU_merged_T24_US$Fiber = factor(OTU_merged_T24_US$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM"))
+
+OTU_merged_T24_MO = OTU_clean_merged %>% filter(Time == 24, Country == "Morocco") %>% column_to_rownames(var = "Row.names")
+OTU_merged_T24_MO[,6:ncol(OTU_merged_T24_MO)] = decostand(OTU_merged_T24_MO[,6:ncol(OTU_merged_T24_MO)], method = "total", MARGIN = 1)
+OTU_merged_T24_MO = OTU_merged_T24_MO %>% unite(col = "AverageID", Subject, Fiber, remove = F) %>% remove_rownames() %>% select(!c("Country","Cohort")) %>% group_by(AverageID) %>% summarise(across(bin_1:(ncol(.)-1), mean)) %>% tidyr::separate(., col = AverageID, into = c("Subject", "Fiber"), sep = "_", remove = F, extra = "warn") %>% column_to_rownames(var = "AverageID")
+OTU_merged_T24_MO$Fiber = factor(OTU_merged_T24_MO$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM"))
+```
+
+Run maaslin2
+```{r eval=FALSE, include=FALSE}
+Maaslin2(input_data = t(OTU_merged_T0[,-(1:2)]), input_metadata = OTU_merged_T0[,1:2], output = "Country_maaslin", min_prevalence = .2, normalization = "TSS", transform = "LOG", analysis_method = "LM", fixed_effects = "Country", max_significance = 0.05, plot_heatmap = T, plot_scatter = T)
+
+Maaslin2(input_data = t(OTU_merged_T24[,-(1:2)]), input_metadata = OTU_merged_T24[,1:2], output = "BOTH_maaslin", min_prevalence = .2, normalization = "TSS", transform = "LOG", analysis_method = "LM", random_effects = "Subject", fixed_effects = "Fiber", reference = "Fiber,NONE", max_significance = 0.05, plot_heatmap = F, plot_scatter = F)
+
+Maaslin2(input_data = t(OTU_merged_T24_US[,-(1:2)]), input_metadata = OTU_merged_T24_US[,1:2], output = "US_maaslin", min_prevalence = .2, normalization = "TSS", transform = "LOG", analysis_method = "LM", random_effects = "Subject", fixed_effects = "Fiber", reference = "Fiber,NONE", max_significance = 0.05, plot_heatmap = F, plot_scatter = F)
+
+Maaslin2(input_data = t(OTU_merged_T24_MO[,-(1:2)]), input_metadata = OTU_merged_T24_MO[,1:2], output = "MO_maaslin", min_prevalence = .2, normalization = "TSS", transform = "LOG", analysis_method = "LM", random_effects = "Subject", fixed_effects = "Fiber", reference = "Fiber,NONE", max_significance = 0.05, plot_heatmap = F, plot_scatter = F)
+```
+
+Import GTDB-tk MAG classification for taxonomy.  
+```{r}
+bacterial_taxonomy = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/gtdb_classification/gtdbtk.bac120.summary.tsv")
+archaeal_taxonomy = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/gtdb_classification/gtdbtk.ar53.summary.tsv")
+taxonomy = rbind(bacterial_taxonomy, archaeal_taxonomy) %>% mutate(user_genome = gsub("_renamed", "", user_genome), species = gsub(".*;s__", "", classification)) %>% select(user_genome, species)
+```
+
+Import results:  
+```{r}
+maas_res_BOTH = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/BOTH_maaslin/significant_results.tsv", check.names = F) %>% filter(coef > 0) %>% merge(taxonomy, ., by.x = "user_genome", by.y = "feature") %>% slice_max(order_by = coef, n = 10)
+maas_res_US = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/US_maaslin/significant_results.tsv", check.names = F) %>% filter(coef > 0)  %>% merge(taxonomy, ., by.x = "user_genome", by.y = "feature") %>% slice_max(order_by = coef, n = 10)
+maas_res_MO = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/MO_maaslin/significant_results.tsv", check.names = F) %>% filter(coef > 0)  %>% merge(taxonomy, ., by.x = "user_genome", by.y = "feature") %>% slice_max(order_by = coef, n = 10)
+maas_res_COUNTRY = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/Country_maaslin/all_results.tsv", check.names = F) %>% merge(taxonomy, ., by.x = "user_genome", by.y = "feature")
+```
+
+Average metadata
+```{r}
+Avg_metadata = metadata %>% unite(col = "AverageID", Subject, Fiber, remove = F) %>% select(!c("Row.names", "Time", "Fiber", "Subject")) %>% distinct()
+```
+
+Add pseudocount for log scale of y axis
+```{r}
+OTU_merged_T24[,3:ncol(OTU_merged_T24)] = OTU_merged_T24[,3:ncol(OTU_merged_T24)] + 0.0001
+dab_plot_df1 = merge(Avg_metadata, OTU_merged_T24, by.x = "AverageID", by.y = "row.names")
+```
+
+Generate plots for differentially abundant microbes.
+```{r}
+dab_plot_both = list()
+
+for (i in 1:nrow(maas_res_BOTH)) {
+    tmp = ggplot(data = dab_plot_df1) +
+    aes_string(x = "Fiber", y = maas_res_BOTH$user_genome[i], fill = "Country") +
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(position = position_jitterdodge(), size = .2, alpha = .2, color = "grey30") +
+    theme_bw() +
+    labs(x = NULL, y = "Relative abundance", title = stringr::str_wrap(string = maas_res_BOTH$species[i], width = 3)) +
+    scale_fill_manual(values = c("#BF0D3E", "steelblue")) +
+    annotate("text", x = Inf, y = Inf, label = bquote("q-value ="~.(formatC(maas_res_BOTH$qval[i], format = "e", digits = 2))), hjust = 1.1, vjust = 3, size = 2) +
+    annotate("text", x = Inf, y = Inf, label = bquote("NONE vs."~.(maas_res_BOTH$value[i])), hjust = 1.1, vjust = 2, size = 2) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), plot.title = element_text(size=7)) +
+    scale_y_log10(limits = c(0.0001, 1.1))
+  
+  dab_plot_both[[length(dab_plot_both)+1]] = tmp
+}
+
+#ggsave(filename = "DAb_plot_BOTH.png", plot = ggarrange(plotlist = dab_plot_both, common.legend = T, ncol = 5, nrow = 2, legend = "bottom"), device = "png", width = 9, height = 5, dpi = 300, bg = "white")
+```
+
+```{r}
+OTU_merged_T24_US[,3:ncol(OTU_merged_T24_US)] = OTU_merged_T24_US[,3:ncol(OTU_merged_T24_US)] + 0.0001
+dab_plot_df2 = merge(Avg_metadata, OTU_merged_T24_US, by.x = "AverageID", by.y = "row.names")
+
+dab_plot_US = list()
+
+for (i in 1:nrow(maas_res_US)) {
+    tmp = ggplot(data = dab_plot_df2) +
+    aes_string(x = "Fiber", y = maas_res_US$user_genome[i], fill = "Country") +
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(position = position_jitterdodge(), size = .5, alpha = .5) +
+    theme_bw() +
+    labs(x = NULL, y = "Relative abundance", title = maas_res_US$species[i]) +
+    scale_fill_manual(values = c("steelblue")) +
+        annotate("text", x = Inf, y = Inf, label = bquote("q-value ="~.(formatC(maas_res_US$qval[i], format = "e", digits = 2))), hjust = 1.1, vjust = 3, size = 2) +
+    annotate("text", x = Inf, y = Inf, label = bquote("NONE vs."~.(maas_res_US$value[i])), hjust = 1.1, vjust = 2, size = 2) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_y_log10(limits = c(0.0001, 1.1))
+  
+  dab_plot_US[[length(dab_plot_US)+1]] = tmp
+}
+
+#ggsave(filename = "DAb_plot_US.png", plot = ggarrange(plotlist = dab_plot_US, common.legend = T, ncol = 5, nrow = 2, legend = "bottom"), device = "png", width = 12, height = 6, dpi = 300)
+```
+
+```{r}
+OTU_merged_T24_MO[,3:ncol(OTU_merged_T24_MO)] = OTU_merged_T24_MO[,3:ncol(OTU_merged_T24_MO)] + 0.0001
+dab_plot_df3 = merge(Avg_metadata, OTU_merged_T24_MO, by.x = "AverageID", by.y = "row.names")
+
+dab_plot_MO = list()
+
+for (i in 1:nrow(maas_res_MO)) {
+    tmp = ggplot(data = dab_plot_df3) +
+    aes_string(x = "Fiber", y = maas_res_MO$user_genome[i], fill = "Country") +
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(position = position_jitterdodge(), size = .5, alpha = .5) +
+    theme_bw() +
+    labs(x = NULL, y = "Relative abundance", title = maas_res_MO$species[i]) +
+    scale_fill_manual(values = c("#BF0D3E", "steelblue")) +
+    annotate("text", x = Inf, y = Inf, label = bquote("q-value ="~.(formatC(maas_res_MO$qval[i], format = "e", digits = 2))), hjust = 1.1, vjust = 3, size = 2) +
+    annotate("text", x = Inf, y = Inf, label = bquote("NONE vs."~.(maas_res_MO$value[i])), hjust = 1.1, vjust = 2, size = 2) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_y_log10(limits = c(0.0001, 1.1))
+  
+  dab_plot_MO[[length(dab_plot_MO)+1]] = tmp
+}
+
+#ggsave(filename = "DAb_plot_MO.png", plot = ggarrange(plotlist = dab_plot_MO, common.legend = T, ncol = 5, nrow = 2, legend = "bottom"), device = "png", width = 12, height = 6, dpi = 300)
+```
+
+Which fiber yielded the most differentially abundant taxa? 
+```{r}
+full_taxonomy = rbind(bacterial_taxonomy, archaeal_taxonomy) %>% mutate(user_genome = gsub("_renamed", "", user_genome)) %>% select(user_genome, classification) %>% mutate(classification = gsub(".__", "", .$classification)) %>% tidyr::separate(col = classification, into = c("L1","L2","L3","L4","L5","L6","L7"), sep = ";", remove = T, extra = "drop") %>% mutate_all(na_if,"")
+
+dab_sum_df = bind_rows(read.delim("/media/julio/Storage/Big_boy_fiber_culturing/BOTH_maaslin/significant_results.tsv", check.names = F) %>% filter(coef > 0) %>% mutate(Country = "Both") %>% merge(., full_taxonomy, by.x = "feature", "user_genome") %>% select("L5", "value", "Country") %>% plyr::count(.), read.delim("/media/julio/Storage/Big_boy_fiber_culturing/US_maaslin/significant_results.tsv", check.names = F) %>% filter(coef > 0) %>% mutate(Country = "US") %>% merge(., full_taxonomy, by.x = "feature", "user_genome") %>% select("L5", "value", "Country") %>% plyr::count(.), read.delim("/media/julio/Storage/Big_boy_fiber_culturing/MO_maaslin/significant_results.tsv", check.names = F) %>% filter(coef > 0) %>% mutate(Country = "Morocco") %>% merge(., full_taxonomy, by.x = "feature", "user_genome") %>% select("L5", "value", "Country") %>% plyr::count(.))
+
+#Take anything that isnt in top 10 and move to Other
+dab_sum_df2 = dab_sum_df %>% group_by(L5) %>% summarise(n = sum(freq)) %>% arrange(desc(n)) %>% slice_head(n = 10)
+dab_sum_df$L5[dab_sum_df$L5 %in% dab_sum_df2$L5 != "TRUE"] <- "Other"
+dab_sum_df = dab_sum_df %>% group_by(L5, value, Country) %>% summarise(freq = sum(freq)) %>% arrange(desc(freq))
+
+dab_sum_df = bind_rows(dab_sum_df[!(dab_sum_df$L5 == "Other"),], dab_sum_df[(dab_sum_df$L5 == "Other"),]) #Move other to bottom
+dab_sum_df$L5 = factor(dab_sum_df$L5, levels = unique(dab_sum_df$L5)) #Fix the order.
+dab_sum_df = bind_rows(dab_sum_df, data.frame(L5 = NA, value = "INULIN", Country = "Both", freq = NA))
+dab_sum_df$value = factor(dab_sum_df$value, levels = c("PECTIN", "PSYLLIUM", "INULIN")) #Fix the order.
+
+Julio_color <- c("#003f5c", "#665191", "#d45087", "#ff7c43","#ffa600", "#7F0A57", "#CD9ABB", "#39A9AB", "#71CFC5", "#007947" ,"gray")
+
+dab_sum_plot = ggplot(data = dab_sum_df) +
+  aes(x = value, y = freq, fill = L5) +
+  geom_bar(color = "black", position='stack', stat='identity') +
+  geom_text(aes(label = freq), position = position_stack(vjust = 0.5), size = 2) +
+  facet_wrap(.~Country) +
+  scale_fill_manual(values = Julio_color) +
+  theme_bw() +
+  labs(x = NULL, y = "Frequency", fill = "Family", title = "Significantly different taxa per fiber", subtitle = "T24 only") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, color = "black"), strip.background = element_rect(fill = "white"))
+dab_sum_plot
+
+#ggsave(filename = "DAb_summary.png", plot = dab_sum_plot, device = "png", dpi = 600, width = 6, height = 5)
+```
+
+Volcano plot of country dabs
+```{r}
+maas_res_COUNTRY = maas_res_COUNTRY %>% mutate(color = case_when(
+  qval < 0.05 & coef > 0 ~ "color1",
+  qval < 0.05 & coef < 0 ~ "color2",
+  qval > 0.05 ~ "color3"
+))
+
+country_volcano_plot = ggplot(data = maas_res_COUNTRY) +
+  aes(x = coef, y = -log10(qval), color = color) +
+  geom_hline(yintercept = -log10(0.05), lty = 2) +
+  geom_vline(xintercept = 0, lty = 3) +
+  geom_point(alpha = 0.5, size = 2) + 
+  scale_color_manual(values = c("steelblue", "#BF0D3E", "gray"), labels = c("Increased", "Decreased", "N.S.")) +
+  labs(title = "Significantly different microbes by country", subtitle = "T0 only", x = "MaAsLin coefficient", y = expression("-log"[10]*"(q-value)"), color = "Abundance in US") +
+  theme_bw() +
+  ggrepel::geom_text_repel(aes(x = coef, y = -log10(qval), label = species), color = "black", size = 2, max.overlaps = 8) +
+  annotate("text", x = -6, y = 6.25, size = 2.5, hjust = 0, label = bquote("Total:"~.(sum(maas_res_COUNTRY$qval < 0.05)))) +
+  annotate("text", x = -6, y = 6, size = 2.5, hjust = 0, label = bquote("Positive:"~.(sum(maas_res_COUNTRY$qval < 0.05 & maas_res_COUNTRY$coef > 0)))) +
+  annotate("text", x = -6, y = 5.75, size = 2.5, hjust = 0, label = bquote("Negative:"~.(sum(maas_res_COUNTRY$qval < 0.05 & maas_res_COUNTRY$coef < 0))))
+country_volcano_plot
+
+#ggsave(filename = "Country_Volcano.png", plot = country_volcano_plot, device = "png", width = 6, height = 4, dpi = 600)
+```
+
+More useful summary figure
+```{r}
+country_summary_df = merge(full_taxonomy, maas_res_COUNTRY, by = "user_genome") %>% filter(!color == "color3") %>% select("L5", "color") %>% plyr::count(.)
+
+country_summary_df2 = country_summary_df %>% group_by(L5) %>% summarise(n = sum(freq)) %>% arrange(desc(n)) %>% slice_head(n = 10)
+country_summary_df$L5[country_summary_df$L5 %in% dab_sum_df2$L5 != "TRUE"] <- "Other"
+country_summary_df = country_summary_df %>% group_by(L5, color) %>% summarise(freq = sum(freq)) %>% arrange(desc(freq))
+
+country_summary_df = bind_rows(country_summary_df[!(country_summary_df$L5 == "Other"),], country_summary_df[(country_summary_df$L5 == "Other"),])
+country_summary_df$L5 = factor(country_summary_df$L5, levels = unique(country_summary_df$L5)) #Fix the order.
+
+country_summ_plot = ggplot(data = country_summary_df) +
+  aes(x = color, y = freq, fill = L5) +
+  geom_bar(color = "black", position='stack', stat='identity') +
+  geom_text(aes(label = freq), position = position_stack(vjust = 0.5), size = 2) +
+  scale_fill_manual(values = Julio_color) +
+  theme_bw() +
+  labs(x = NULL, y = "Frequency", fill = "Family", title = "Significantly different taxa by country", subtitle = "T0 only") +
+  scale_x_discrete(labels = c("US", "MO")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, color = "black"), strip.background = element_rect(fill = "white"))
+country_summ_plot
+```
+
+Adding cazyme data.  
+First I need to import all functional tables and annotations.  
+```{r}
+ORF_table = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/contig_table.txt", row.names=1, check.names = F)
+
+eggnog_anots = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/eggnog.emapper.annotations", comment.char="", header = F, check.names = F) %>% tail(-5)
+crass_cazyme = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/dbcan_output/overview.txt", check.names = F)
+genome_equivs = read.table("Genome_equivalents_merged.txt", quote="\"", comment.char="")
+
+file_list = list.files(path = "/media/julio/Storage/Big_boy_fiber_culturing/renamed_overview_files/", pattern = "*_overview.txt", full.names = T)
+MAG_cazymes = sapply(file_list, read.delim, simplify=F)
+names(MAG_cazymes) = gsub(".*bin_", "bin_", names(MAG_cazymes))
+names(MAG_cazymes) = gsub("_overview.txt", "", names(MAG_cazymes))
+MAG_cazymes = lapply(MAG_cazymes, FUN = function(x) {filter(x, X.ofTools == 3)}) #First only grab cazymes that were annotated with all 3 tools in dbcan3
+```
+
+What cazymes and in what proportion are they found in the top N differentially abundant MAGs
+```{r}
+n_cazyme_per_mag = list()
+
+for (i in 1:length(MAG_cazymes)) {
+    tmp = data.frame(binID = names(MAG_cazymes)[i], GH = length(grep("GH", MAG_cazymes[[i]][,5])), GT = length(grep("GT", MAG_cazymes[[i]][,5])), PL = length(grep("PL", MAG_cazymes[[i]][,5])), CE = length(grep("CE", MAG_cazymes[[i]][,5])), AA = length(grep("AA", MAG_cazymes[[i]][,5])))
+    tmp$sum = sum(tmp$GH, tmp$GT, tmp$PL, tmp$CE, tmp$AA)
+    
+    n_cazyme_per_mag[[length(n_cazyme_per_mag)+1]] = tmp
+}
+
+n_cazyme_per_mag = bind_rows(n_cazyme_per_mag) %>% merge(., taxonomy, by.x = "binID", by.y = "user_genome") %>% arrange(desc(sum))
+```
+
+Top 25 overall
+```{r}
+cazy_bp_df_top25 = n_cazyme_per_mag %>% select(!c("sum", "binID")) %>% slice_head(n = 25) %>% reshape2::melt()
+cazy_bp_df_top25$species = factor(x = cazy_bp_df_top25$species, levels = unique(n_cazyme_per_mag$species))
+
+ggplot(data = cazy_bp_df_top25, aes(x = species, y = value, fill = variable)) +
+  geom_bar(color = "black", position='stack', stat='identity') +
+  theme_bw() +
+  labs(x = NULL, y = "\n \n No. of CAZymes", fill = "Enzyme class", title = "Top 25 CAZyme-encoding taxa") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Dark2")
+```
+
+Bottom 25 overall, not very interesting in my opinion.  
+```{r}
+cazy_bp_df_bot25 = n_cazyme_per_mag %>% select(!c("sum", "binID")) %>% slice_tail(n = 25) %>% reshape2::melt()
+cazy_bp_df_bot25$species = factor(x = cazy_bp_df_bot25$species, levels = unique(n_cazyme_per_mag$species))
+
+ggplot(data = cazy_bp_df_bot25, aes(x = species, y = value, fill = variable)) +
+  geom_bar(color = "black", position='stack', stat='identity') +
+  theme_bw() +
+  labs(x = NULL, y = "\n \n No. of CAZymes", fill = "Enzyme class", title = "Bottom 25 CAZyme-encoding taxa", subtitle = "All fibers") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Dark2")
+```
+
+Only cazymes from the top n diff ab taxa.  
+```{r}
+cazy_bp_df_dab = n_cazyme_per_mag %>% select(!c("sum", "binID")) %>% filter(species %in% maas_res_BOTH$species) %>% reshape2::melt()
+cazy_bp_df_dab$species = factor(x = cazy_bp_df_dab$species, levels = unique(n_cazyme_per_mag$species))
+
+ggplot(data = cazy_bp_df_dab, aes(x = species, y = value, fill = variable)) +
+  geom_bar(color = "black", position='stack', stat='identity') +
+  theme_bw() +
+  labs(x = NULL, y = "\n \n \n \n No. of CAZymes", fill = "Enzyme class", title = "CAZymes of top 10 differentially abundant taxa") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Dark2")
+```
+
+Are there any CAZYmes that are shared between the top n features?  
+```{r}
+pectin_dabs = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/BOTH_maaslin/significant_results.tsv", check.names = F) %>% filter(coef > 0) %>% merge(taxonomy, ., by.x = "user_genome", by.y = "feature") %>% filter(value == "PECTIN")
+
+common_cazy_df = n_cazyme_per_mag %>% filter(species %in% pectin_dabs$species)
+common_cazy_df = MAG_cazymes[names(MAG_cazymes) %in% common_cazy_df$binID]
+
+for (i in 1:length(common_cazy_df)) {
+    common_cazy_df[[i]]$binID = names(common_cazy_df)[i]
+}
+
+common_cazy_df2 = bind_rows(common_cazy_df) %>% select(DIAMOND, binID) %>% merge(., taxonomy, by.x = "binID", by.y = "user_genome") %>% filter(!species == "")
+common_cazy_df3 = common_cazy_df2 %>% count(DIAMOND) %>% arrange(desc(n)) %>% slice_head(n = 5)
+common_cazy_df4 = common_cazy_df2 %>% count(species) %>% arrange(desc(n)) %>% slice_head(n = 10)
+common_cazy_df2$species[common_cazy_df2$species %in% common_cazy_df4$species != "TRUE"] <- "Other"
+common_cazy_df5 = common_cazy_df2 %>% count(DIAMOND, species) %>% filter(DIAMOND %in% common_cazy_df3$DIAMOND) %>% arrange(desc(n)) 
+
+common_cazy_df5$DIAMOND = factor(common_cazy_df5$DIAMOND, levels = common_cazy_df3$DIAMOND)
+common_cazy_df5 = rbind(common_cazy_df5[!(common_cazy_df5$species == "Other"),],common_cazy_df5[(common_cazy_df5$species == "Other"),]) #Move other to bottom
+common_cazy_df5$species <- factor(common_cazy_df5$species, levels = unique(common_cazy_df5$species)) #Fix the order
+
+pectin_cazy_plot = ggplot(data = common_cazy_df5, aes(x = DIAMOND, y = n, fill = species)) +
+  geom_bar(position='stack', stat='identity') +
+  theme_bw() +
+  labs(x = NULL, y = "Distinct CAZymes", fill = "Microbe", title = "Pectin enrichments") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = Julio_color)
+pectin_cazy_plot
+```
+
+Top 10 DAB microbes, pectin only.  
+```{r}
+pectin_dabs2 = maas_res_BOTH %>% filter(value == "PECTIN")
+
+common_cazy_df2.1 = n_cazyme_per_mag %>% filter(species %in% pectin_dabs2$species)
+common_cazy_df2.1 = MAG_cazymes[names(MAG_cazymes) %in% common_cazy_df2.1$binID]
+
+for (i in 1:length(common_cazy_df2.1)) {
+    common_cazy_df2.1[[i]]$binID = names(common_cazy_df2.1)[i]
+}
+
+common_cazy_df2.2 = bind_rows(common_cazy_df2.1) %>% select(DIAMOND, binID) %>% merge(., taxonomy, by.x = "binID", by.y = "user_genome") %>% filter(!species == "")
+common_cazy_df2.3 = common_cazy_df2.2 %>% count(DIAMOND) %>% arrange(desc(n)) %>% slice_head(n = 10)
+
+common_cazy_df2.5 = common_cazy_df2.2 %>% count(DIAMOND, species) %>% filter(DIAMOND %in% common_cazy_df2.3$DIAMOND) %>% arrange(desc(n)) 
+common_cazy_df2.5$DIAMOND = factor(common_cazy_df2.5$DIAMOND, levels = common_cazy_df2.3$DIAMOND)
+
+ggplot(data = common_cazy_df2.5, aes(x = DIAMOND, y = n, fill = species)) +
+  geom_bar(color = "black", position='stack', stat='identity') +
+  theme_bw() +
+  labs(x = NULL, y = "Distinct CAZymes", fill = "Microbe", title = "Top 10 CAZyme classes by microbe", subtitle = "Top 10 significant pectin enrichments") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Dark2")
+```
+
+Looking at the cazyme representation of psyllium.  
+```{r}
+psy_dabs = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/BOTH_maaslin/significant_results.tsv", check.names = F) %>% filter(coef > 0) %>% merge(taxonomy, ., by.x = "user_genome", by.y = "feature") %>% filter(value == "PSYLLIUM")
+
+common_cazy_df3.1 = n_cazyme_per_mag %>% filter(species %in% psy_dabs$species)
+common_cazy_df3.1 = MAG_cazymes[names(MAG_cazymes) %in% common_cazy_df3.1$binID]
+
+for (i in 1:length(common_cazy_df3.1)) {
+    common_cazy_df3.1[[i]]$binID = names(common_cazy_df3.1)[i]
+}
+
+common_cazy_df3.2 = bind_rows(common_cazy_df3.1) %>% select(DIAMOND, binID) %>% merge(., taxonomy, by.x = "binID", by.y = "user_genome") %>% filter(!species == "")
+common_cazy_df3.3 = common_cazy_df3.2 %>% count(DIAMOND) %>% arrange(desc(n)) %>% slice_head(n = 5)
+common_cazy_df3.4 = common_cazy_df3.2 %>% count(species) %>% arrange(desc(n)) %>% slice_head(n = 10)
+common_cazy_df3.2$species[common_cazy_df3.2$species %in% common_cazy_df3.4$species != "TRUE"] <- "Other"
+common_cazy_df3.5 = common_cazy_df3.2 %>% count(DIAMOND, species) %>% filter(DIAMOND %in% common_cazy_df3.3$DIAMOND) %>% arrange(desc(n)) 
+
+common_cazy_df3.5$DIAMOND = factor(common_cazy_df3.5$DIAMOND, levels = common_cazy_df3.3$DIAMOND)
+common_cazy_df3.5 = rbind(common_cazy_df3.5[!(common_cazy_df3.5$species == "Other"),],common_cazy_df3.5[(common_cazy_df3.5$species == "Other"),]) #Move other to bottom
+common_cazy_df3.5$species <- factor(common_cazy_df3.5$species, levels = unique(common_cazy_df3.5$species)) #Fix the order
+
+psyl_cazy_plot = ggplot(data = common_cazy_df3.5, aes(x = DIAMOND, y = n, fill = species)) +
+  geom_bar(position='stack', stat='identity') +
+  theme_bw() +
+  labs(x = NULL, y = "Distinct CAZymes", fill = "Microbe", title = "Psyllium enrichments") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = Julio_color)
+psyl_cazy_plot
+```
+
+Top 10 DAB microbes, psyllium only.  
+```{r}
+psy_dabs2 = maas_res_BOTH %>% filter(value == "PSYLLIUM")
+
+common_cazy_df4.1 = n_cazyme_per_mag %>% filter(species %in% psy_dabs2$species)
+common_cazy_df4.1 = MAG_cazymes[names(MAG_cazymes) %in% common_cazy_df4.1$binID]
+
+for (i in 1:length(common_cazy_df4.1)) {
+    common_cazy_df4.1[[i]]$binID = names(common_cazy_df4.1)[i]
+}
+
+common_cazy_df4.2 = bind_rows(common_cazy_df4.1) %>% select(DIAMOND, binID) %>% merge(., taxonomy, by.x = "binID", by.y = "user_genome") %>% filter(!species == "")
+common_cazy_df4.3 = common_cazy_df4.2 %>% count(DIAMOND) %>% arrange(desc(n)) %>% slice_head(n = 10)
+
+common_cazy_df4.5 = common_cazy_df4.2 %>% count(DIAMOND, species) %>% filter(DIAMOND %in% common_cazy_df4.3$DIAMOND) %>% arrange(desc(n)) 
+common_cazy_df4.5$DIAMOND = factor(common_cazy_df4.5$DIAMOND, levels = common_cazy_df4.3$DIAMOND)
+
+ggplot(data = common_cazy_df4.5, aes(x = DIAMOND, y = n, fill = species)) +
+  geom_bar(color = "black", position='stack', stat='identity') +
+  theme_bw() +
+  labs(x = NULL, y = "Distinct CAZymes", fill = "Microbe", title = "Top 10 CAZyme classes by microbe", subtitle = "Top 10 significant psyllium enrichments") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Dark2")
+```
+Seems like most are shared between psyllium and pectin.  
+
+What about at baseline?  
+```{r}
+All_cazymes = MAG_cazymes[sapply(MAG_cazymes, nrow)>0]
+
+for (i in 1:length(All_cazymes)) {
+    All_cazymes[[i]]$binID = names(All_cazymes)[i]
+}
+
+All_cazy_df2 = bind_rows(All_cazymes) %>% select(DIAMOND, binID) %>% merge(., taxonomy, by.x = "binID", by.y = "user_genome") %>% filter(!species == "")
+All_cazy_df3 = All_cazy_df2 %>% count(DIAMOND) %>% arrange(desc(n)) %>% slice_head(n = 5)
+All_cazy_df4 = All_cazy_df2 %>% count(species) %>% arrange(desc(n)) %>% slice_head(n = 10)
+All_cazy_df2$species[All_cazy_df2$species %in% All_cazy_df4$species != "TRUE"] <- "Other"
+All_cazy_df5 = All_cazy_df2 %>% count(DIAMOND, species) %>% filter(DIAMOND %in% All_cazy_df3$DIAMOND) %>% arrange(desc(n)) 
+
+All_cazy_df5$DIAMOND = factor(All_cazy_df5$DIAMOND, levels = All_cazy_df3$DIAMOND)
+All_cazy_df5 = rbind(All_cazy_df5[!(All_cazy_df5$species == "Other"),],All_cazy_df5[(All_cazy_df5$species == "Other"),]) #Move other to bottom
+All_cazy_df5$species <- factor(All_cazy_df5$species, levels = unique(All_cazy_df5$species)) #Fix the order
+
+all_cazy_plot = ggplot(data = All_cazy_df5, aes(x = DIAMOND, y = n, fill = species)) +
+  geom_bar(position='stack', stat='identity') +
+  theme_bw() +
+  labs(x = NULL, y = "Distinct CAZymes", fill = "Microbe", title = "All microbes") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = Julio_color)
+all_cazy_plot
+```
+
+Heatmap
+```{r heatmap, eval=FALSE, include=FALSE}
+spearman_corr = OTU_merged_T24_MO %>% select(!Subject:Fiber) %>% t(.) %>% merge(taxonomy, ., by.y = "row.names", by.x = "user_genome") %>% filter(!species == "") %>% column_to_rownames(var = "species") %>% select(!user_genome)
+spearman_corr = rcorr(as.matrix(t(spearman_corr)), type = "spearman", )
+
+heatmap_df = reshape2::melt(as.matrix(spearman_corr$r))
+heatmap_df2 = reshape2::melt(as.matrix(spearman_corr$P))
+heatmap_df$p_val = heatmap_df2$value %>% replace(is.na(.), 1) #Combine p values and correlation values
+heatmap_df = heatmap_df %>% mutate(sig_p = ifelse(p_val <= .05, T, F), weak_r = ifelse(abs(value) < .3, T, F))
+heatmap_df3 = heatmap_df %>% group_by(Var1) %>% summarise(n_p = sum(sig_p)) %>% filter(!n_p == 0) #Count the number of significant p values.
+heatmap_df = heatmap_df%>% filter(Var1 %in% heatmap_df3$Var1) #Remove the taxa from the original data frame that don't have any significant correlations.
+
+#Unmelt filtered dataframe for hierarchical clustering
+heatmap_df4 = reshape2::dcast(data = heatmap_df[,1:3], formula = Var1 ~ Var2) %>% column_to_rownames(var = "Var1")
+
+clust_order1 = hclust(dist(heatmap_df4, method = "euclidean")) #Create hierarchical clustering
+heatmap_df$Var1 = factor(heatmap_df$Var1, levels = rownames(heatmap_df4)[clust_order1$order])
+clust_order2 = hclust(dist(t(heatmap_df4), method = "euclidean")) #Create hierarchical clustering
+heatmap_df$Var2 = factor(heatmap_df$Var2, levels = colnames(heatmap_df4)[clust_order2$order])
+
+heatmap = ggplot(data = heatmap_df) +
+  geom_tile(aes(y = Var2, x = Var1, fill = value)) +
+  #geom_point(data = heatmap_df[heatmap_df$sig_p == T,], aes(y = Var2, x = Var1), shape = 8, size = .1) +
+  scale_fill_gradient2(mid="#FBFEF9",low="#0C6291",high="#A63446", limits=c(-1,1)) +
+  theme_classic() +
+  labs(x = NULL, y = NULL, fill = "Spearman's Rho") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 4), axis.text.y = element_text(size = 4))
+heatmap
+
+ggsave(heatmap, filename = "heatmap.png", device = "png", dpi = 600, width = 18, height = 16)
+```
+
+Descriptive CAZyme analysis:  
+First step is to make annotated contig table, normalized by genome equivalents per kb.  
+```{r Cross_cazy}
+#Just grab any random sample for the gene lengths to divide by
+gene_lengths = read.delim("Py_F17-1-24_norm.txt", header=FALSE, comment.char="#") %>% .[,1:2]
+colnames(gene_lengths) = c("ORF", "gene_length")
+gene_lengths$gene_length = gene_lengths$gene_length/1000 #in Kb
+
+#Divide reads hitting to ORF by gene length & genome equivalents.
+RPKG = merge(gene_lengths, ORF_table, by.x = "ORF", by.y = "row.names") %>% column_to_rownames(var = "ORF")
+RPKG = RPKG[,-1]/RPKG$gene_length
+RPKG2 = merge(genome_equivs, t(RPKG), by.x = "V1", by = "row.names") %>% column_to_rownames(var = "V1")
+RPKG2 = as.data.frame(t(RPKG2[,-1]/RPKG2$V2))
+
+#Merge with the annotations.  
+cazyme_table = merge(crass_cazyme, RPKG2, by.x = "Gene ID", by.y = "row.names") %>% filter(`#ofTools` == 3) %>% select(!c("EC#", "HMMER", "eCAMI", "DIAMOND", "#ofTools")) %>% column_to_rownames(var = "Gene ID") %>% select(alpha_df$Row.names) %>% select_if(~ !any(is.na(.))) %>% select(!which(colSums(.) == 0))
+```
+
+Alpha diversity
+```{r}
+cazy_alpha = as.data.frame(diversity(x = t(cazyme_table))) %>% merge(., y = metadata, by.x = "row.names", by.y = "Row.names") %>% rename(Shannon = `diversity(x = t(cazyme_table))`)
+
+alpha_lm <- NULL
+alpha_lm$x <- as.numeric(cazy_alpha$Shannon)
+alpha_lm$c <- as.factor(cazy_alpha$Country)
+alpha_lm$s <- as.factor(cazy_alpha$Subject)
+alpha_lm$t <- as.factor(cazy_alpha$Time)
+alpha_lm$f <- as.factor(cazy_alpha$Fiber)
+alpha_lm <- as.data.frame(alpha_lm)
+alpha_lm <- within(alpha_lm, f <- relevel(f, "NONE"))
+
+alpha_lm = alpha_lm %>% group_by(s, t, f, c) %>% summarise(x = mean(x)) 
+
+summary(lme(x ~ c, data = alpha_lm[alpha_lm$t == 0,], random = list(s=~1))) #p = 0.19 for countries having at T0
+
+summary(lme(x ~ f, data = alpha_lm[alpha_lm$t == 24 & alpha_lm$c == "US",], random = list(s=~1))) #Inulin is significantly decreased in the US, pectin is marginally decreased
+summary(lme(x ~ f, data = alpha_lm[alpha_lm$t == 24 & alpha_lm$c == "Morocco",], random = list(s=~1))) #No differences
+```
+
+
+```{r}
+cazy_alpha$Fiber = factor(cazy_alpha$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM", "CTRL"))
+
+cazy_alpha_plot = ggplot(data = cazy_alpha) +
+  aes(x = Fiber, y = Shannon, fill = Country) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_grid(.~Time, scales = "free", space = "free") +
+  geom_point(position = position_jitterdodge(jitter.width = .1), alpha = 0.5) +
+  scale_fill_manual(values = c("#BF0D3E", "steelblue")) +
+  #geom_text(label = cazy_alpha$Row.names, position = position_jitterdodge(jitter.width = .1)) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill="white")) +
+  labs(x = NULL, y = "Shannon Diversity", title = "CAZyme diversity")
+
+Fig2ad = ggarrange(Shannon_plot, cazy_alpha_plot, nrow = 1, common.legend = T, legend = "bottom", labels = c("a.", "d."))
+```
+
+CAZyme beta diversity:  
+```{r}
+cazyme_table_merged = as.data.frame(t(cazyme_table)) %>% filter(rownames(.) %in% alpha_df$Row.names) %>% merge(metadata, ., by.x = "Row.names", by.y = "row.names")
+
+T0_nmds_cazy = cazyme_table_merged %>% filter(Time == 0) %>% column_to_rownames(var = "Row.names") %>% select(k127_100007_1:ncol(.)) %>% metaMDS(comm = ., trymax = 128, parallel = 32, k = 2)
+
+T0_points_cazy = T0_nmds_cazy$points %>% merge(., metadata, by.x = "row.names", by.y = "Row.names") %>% unite("Country_Time", Country, Time, remove = F)
+T0_points_cazy$Fiber = factor(T0_points_cazy$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM", "CTRL"))
+
+fig2e = ggplot(data = T0_points_cazy) +
+  aes(x = MDS1, y = MDS2) +
+  stat_ellipse(aes(mapping = Country_Time, color = Country_Time), alpha = 0.5, lty = 2) +
+  geom_point(aes(fill = Country), pch = 21, color = "black", size = 5, alpha = 0.5) +
+  #geom_text(label = T0_points_cazy$Subject, color = "black", size = 2.5, alpha = 0.7) +
+  scale_shape_manual(values = c(21,23)) +
+  scale_fill_manual(values = c("#BF0D3E", "steelblue")) +
+  scale_color_manual(values = c("#BF0D3E", "steelblue")) +
+  guides(color = "none", fill = guide_legend(override.aes = list(shape = 21))) +
+  theme_bw() +
+  labs(title = "CAZyme", subtitle = "T0 only") +
+  annotate("text", x = .5, y = 10, label = bquote("Stress ="~.(round(T0_nmds_cazy$stress, digits = 2))), hjust = 1) +
+  annotate("text", x = .5, y = 9, label = "k = 2", hjust = 1)
+
+#T24
+T24_nmds_cazy = cazyme_table_merged %>% filter(Time == 24, !Row.names %in% c("I_F17-1-24", "F18-1-24", "I_F19-2-24", "Py_F13-3-24", "Py_F23-3-24", "I_F19-1-24", "Pc_F25-3-24")) %>% column_to_rownames(var = "Row.names") %>% select(k127_100007_1:ncol(.)) %>% metaMDS(comm = ., trymax = 1024, parallel = 32, k = 3, distance = "bray")
+
+T24_points_cazy = T24_nmds_cazy$points %>% merge(., metadata, by.x = "row.names", by.y = "Row.names") %>% unite("Country_Fiber", Country, Fiber, remove = F)
+T24_points_cazy$Fiber = factor(T24_points_cazy$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM", "CTRL"))
+
+fig2f = ggplot(data = as.data.frame(T24_points_cazy)) +
+  aes(x = MDS1, y = MDS2) +
+  stat_ellipse(aes(mapping = Country_Fiber, color = Country_Fiber), alpha = 0.5, lty = 2) +
+  geom_point(aes(fill = Fiber, pch = Country), color = "black", size = 5, alpha = 0.5) +
+  #geom_text(label = T24_points_cazy$Row.names, color = "black", size = 2.5, alpha = 0.7) +
+  scale_shape_manual(values = c(21,23)) +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_manual(values = c("#d95f02","#1b9e77", "#7570b3", "#e7298a", "#d95f02", "#1b9e77", "#7570b3", "#e7298a")) +
+  guides(color = "none", fill = guide_legend(override.aes = list(shape = 21))) +
+  theme_bw() +
+  labs(title = "CAZyme", subtitle = "T24 only") +
+  annotate("text", x = 3, y = -3.25, label = bquote("Stress ="~.(round(T24_nmds_cazy$stress, digits = 2))), hjust = 1) +
+  annotate("text", x = 3, y = -3, label = "k = 3", hjust = 1)
+
+cazy_bray = vegdist(as.data.frame(t(cazyme_table)), method = "bray")
+cazy_pcoa = cmdscale(cazy_bray, eig = T, k = (ncol(cazyme_table)-1), add = T)
+cazy_eig = eigenvals(cazy_pcoa)
+pcoa_var = cazy_eig/sum(cazy_eig)
+cazy_points = as.data.frame(cazy_pcoa$points[,1:2]) %>% merge(., metadata, by.x = "row.names", by.y = "Row.names") %>% unite("Country_Time", Country, Time, remove = F)
+cazy_points$Fiber = factor(cazy_points$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM"))
+
+
+cazy_pcoa_plot1 = ggplot(data = cazy_points) +
+  aes(x = V1, y = V2) +
+  stat_ellipse(aes(mapping = Country_Time, color = Country_Time), alpha = 0.5, lty = 2) +
+  geom_point(aes(pch = Time, fill = Country), color = "black", size = 5, alpha = 0.5) +
+  #geom_text(label = nmds_df$Subject, color = "black", size = 2.5, alpha = 0.7) +
+  scale_shape_manual(values = c(21,23)) +
+  scale_fill_manual(values = c("#BF0D3E", "steelblue")) +
+  scale_color_manual(values = c("#BF0D3E", "#BF0D3E", "steelblue", "steelblue")) +
+  guides(color = "none", fill = guide_legend(override.aes = list(shape = 21))) +
+  theme_bw() +
+  labs(title = "CAZyme - Bray-Curtis", x = bquote("PCo1 ("~.(round(pcoa_var[1]*100, digits = 1))~"%) "), y = bquote("PCo2 ("~.(round(pcoa_var[2]*100, digits = 1))~"%) "))
+
+fig2top = ggarrange(Shannon_plot, cazy_alpha_plot, Fig2b, fig2e, common.legend = T, legend = "bottom", labels = c("a.", "d.", "b.", "e."), heights = c(2,3))
+fig2bottom = ggarrange(Fig2c, fig2f, common.legend = T, legend = "bottom", nrow = 1, labels = c("c.", "f."))
+fig2 = ggarrange(fig2top, fig2bottom, ncol = 1, heights = c(1.6,1))
+
+ggsave(filename = "Figure_2.png", plot = fig2, device = "png", width = 10, height = 12, dpi = 600, bg = "white")
+```
+
+Same plot but colored by fiber.  
+```{r eval=FALSE, include=FALSE}
+cazy_pcoa_plot2 = ggplot(data = cazy_points) +
+  aes(x = V1, y = V2) +
+  stat_ellipse(aes(mapping = Fiber, color = Fiber), alpha = 0.5, lty = 2) +
+  geom_point(aes(pch = Time, fill = Fiber), color = "black", size = 5, alpha = 0.5) +
+  #geom_text(label = nmds_df$Subject, color = "black", size = 2.5, alpha = 0.7) +
+  scale_shape_manual(values = c(21,23)) +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_brewer(palette = "Dark2") +
+  guides(color = "none", fill = guide_legend(override.aes = list(shape = 21))) +
+  theme_bw() +
+  labs(title = "CAZyme - Bray-Curtis", x = bquote("PCo1 ("~.(round(pcoa_var[1]*100, digits = 1))~"%) "), y = bquote("PCo2 ("~.(round(pcoa_var[2]*100, digits = 1))~"%) "))
+
+ggsave(filename = "Beta_plot_fiber.png", plot = ggarrange(Fig3b, cazy_pcoa_plot2, common.legend = T, legend = "right", nrow = 1), device = "png", dpi = 600, width = 13, height = 6)
+```
+
+permanova.  
+```{r}
+cazy_perma_out = adonis2(formula = cazyme_table_merged[,7:ncol(cazyme_table_merged)] ~ Country / Subject / Fiber, data = cazyme_table_merged, permutations = 999, method = "bray", parallel = 32, strata = cazyme_table_merged$Time)
+cazy_perma_out
+
+#T0
+T0_OTU_cazy = cazyme_table_merged %>% filter(Time == 0)
+perma_out6 = adonis2(formula = T0_OTU_cazy[,7:ncol(T0_OTU_cazy)] ~ Country / Subject, data = T0_OTU_cazy, permutations = 999, method = "bray", parallel = 32)
+
+#T24
+T24_OTU_cazy = cazyme_table_merged %>% filter(Time == 24)
+perma_out7 = adonis2(formula = T24_OTU_cazy[,7:ncol(T24_OTU_cazy)] ~ Country / Subject / Fiber, data = T24_OTU_cazy, permutations = 999, method = "bray", parallel = 32)
+
+#T24, separate cohorts 
+US_T24_OTU_cazy = T24_OTU_cazy %>% filter(Country == "US")
+perma_out8 = adonis2(formula = US_T24_OTU[,7:ncol(US_T24_OTU)] ~ Subject / Fiber, data = US_T24_OTU, permutations = 999, method = "bray", parallel = 32)
+
+MO_T24_OTU_cazy = T24_OTU_cazy %>% filter(Country == "Morocco")
+perma_out9 = adonis2(formula = MO_T24_OTU[,7:ncol(MO_T24_OTU)] ~ Subject / Fiber, data = MO_T24_OTU, permutations = 999, method = "bray", parallel = 32)
+```
+
+Maaslin.  
+```{r}
+maas_in = cazyme_table_merged %>% filter(Time == 24, Country %in% c("US", "Morocco")) %>% column_to_rownames(var = "Row.names")
+maas_in = maas_in %>% unite(col = "AverageID", Subject, Fiber, remove = F) %>% remove_rownames() %>% select(!c("Country","Cohort")) %>% group_by(AverageID) %>% summarise(across(k127_100007_1:(ncol(.)-1), mean)) %>% tidyr::separate(., col = AverageID, into = c("Subject", "Fiber"), sep = "_", remove = F, extra = "warn") %>% column_to_rownames(var = "AverageID")
+
+maas_in_US = cazyme_table_merged %>% filter(Time == 24, Country == "US") %>% column_to_rownames(var = "Row.names")
+maas_in_US = maas_in_US %>% unite(col = "AverageID", Subject, Fiber, remove = F) %>% remove_rownames() %>% select(!c("Country","Cohort")) %>% group_by(AverageID) %>% summarise(across(k127_100007_1:(ncol(.)-1), mean)) %>% tidyr::separate(., col = AverageID, into = c("Subject", "Fiber"), sep = "_", remove = F, extra = "warn") %>% column_to_rownames(var = "AverageID")
+
+maas_in_MO = cazyme_table_merged %>% filter(Time == 24, Country == "Morocco") %>% column_to_rownames(var = "Row.names")
+maas_in_MO = maas_in_MO %>% unite(col = "AverageID", Subject, Fiber, remove = F) %>% remove_rownames() %>% select(!c("Country","Cohort")) %>% group_by(AverageID) %>% summarise(across(k127_100007_1:(ncol(.)-1), mean)) %>% tidyr::separate(., col = AverageID, into = c("Subject", "Fiber"), sep = "_", remove = F, extra = "warn") %>% column_to_rownames(var = "AverageID")
+```
+
+```{r eval=FALSE, include=FALSE}
+Maaslin2(input_data = t(maas_in[,-(1:2)]), input_metadata = maas_in[,1:2], output = "CAZY_maaslin", min_prevalence = .2, normalization = "NONE", transform = "LOG", analysis_method = "LM", random_effects = "Subject", fixed_effects = "Fiber", reference = "Fiber,NONE", max_significance = 0.05, plot_heatmap = F, plot_scatter = F)
+
+Maaslin2(input_data = t(maas_in_US[,-(1:2)]), input_metadata = maas_in_US[,1:2], output = "CAZY_US_maaslin", min_prevalence = .2, normalization = "NONE", transform = "LOG", analysis_method = "LM", random_effects = "Subject", fixed_effects = "Fiber", reference = "Fiber,NONE", max_significance = 0.05, plot_heatmap = F, plot_scatter = F)
+
+Maaslin2(input_data = t(maas_in_MO[,-(1:2)]), input_metadata = maas_in_MO[,1:2], output = "CAZY_MO_maaslin", min_prevalence = .2, normalization = "NONE", transform = "LOG", analysis_method = "LM", random_effects = "Subject", fixed_effects = "Fiber", reference = "Fiber,NONE", max_significance = 0.05, plot_heatmap = F, plot_scatter = F)
+```
+
+Import maaslin results:  
+```{r eval=FALSE, include=FALSE}
+maas_res_cazy = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/CAZY_maaslin/significant_results.tsv", check.names = F) %>% filter(coef > 0) %>% merge(crass_cazyme, ., by.x = "Gene ID", by.y = "feature") %>% slice_max(order_by = coef, n = 10)
+maas_res_cazy_US = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/CAZY_US_maaslin/significant_results.tsv", check.names = F) %>% filter(coef > 0) %>% merge(crass_cazyme, ., by.x = "Gene ID", by.y = "feature") %>% slice_max(order_by = coef, n = 10)
+maas_res_cazy_MO = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/CAZY_MO_maaslin/significant_results.tsv", check.names = F) %>% filter(coef > 0) %>% merge(crass_cazyme, ., by.x = "Gene ID", by.y = "feature") %>% slice_max(order_by = coef, n = 10)
+```
+
+Pie chart:
+```{r eval=FALSE, include=FALSE}
+pi_chart_df2 = read.delim("/media/julio/Storage/Big_boy_fiber_culturing/CAZY_maaslin/significant_results.tsv", check.names = F) %>% filter(coef > 0) 
+pi_chart_df2 = plyr::count(pi_chart_df2$value)
+
+pi_chart_df2$x = factor(pi_chart_df2$x, levels = c("PECTIN", "PSYLLIUM", "INULIN"))
+
+ggplot(pi_chart_df2, aes(x="", y=freq, fill=x)) +
+  geom_bar(stat="identity", color = "black") +
+  geom_text(aes(x = 1.6, y = freq/2, label = freq), size = 6) +
+  coord_polar("y", start=0) +
+  theme_void() +
+  labs(fill = "Fiber", title = "Number of diff. ab. CAZymes per fiber") +
+  scale_fill_manual(values = c("#7570b3", "#e7298a", "#a6761d"))
+```
+
+There was no significantly different CAZymes at the ORF level.  
+What if we group together by CAZyme subfamily?
+```{r}
+cazyme_table_fam = merge(crass_cazyme, RPKG2, by.x = "Gene ID", by.y = "row.names") %>% filter(`#ofTools` == 3) %>% select(!c("EC#", "HMMER", "eCAMI", "#ofTools", "Gene ID")) %>% group_by(DIAMOND) %>% summarise(across(2:(ncol(.)-1), sum)) %>% column_to_rownames(var = "DIAMOND") %>% select(alpha_df$Row.names) %>% select_if(~ !any(is.na(.))) %>% select(!which(colSums(.) == 0))
+
+cazyme_table_fam_merged = as.data.frame(t(cazyme_table_fam)) %>% merge(metadata, ., by.x = "Row.names", by.y = "row.names")
+
+maas_in_fam = cazyme_table_fam_merged %>% filter(Time == 24, Country %in% c("US", "Morocco")) %>% column_to_rownames(var = "Row.names")
+
+maas_in_fam = maas_in_fam %>% unite(col = "AverageID", Subject, Fiber, remove = F) %>% remove_rownames() %>% select(!c("Country","Cohort")) %>% group_by(AverageID) %>% summarise(across(AA1:(ncol(.)-1), mean)) %>% tidyr::separate(., col = AverageID, into = c("Subject", "Fiber"), sep = "_", remove = F, extra = "warn") %>% column_to_rownames(var = "AverageID")
+
+Maaslin2(input_data = t(maas_in_fam[,-(1:2)]), input_metadata = maas_in_fam[,1:2], output = "CAZY_maaslin", min_prevalence = .2, normalization = "NONE", transform = "LOG", analysis_method = "LM", random_effects = "Subject", fixed_effects = "Fiber", reference = "Fiber,NONE", max_significance = 0.25, plot_heatmap = F, plot_scatter = F)
+```
+Also no.  
+
+Generate plots for differentially abundant cazymes
+```{r eval=FALSE, include=FALSE}
+cazyme_table_merged$Fiber = factor(cazyme_table_merged$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM"))
+cazyme_table_merged[,7:ncol(cazyme_table_merged)] = cazyme_table_merged[,7:ncol(cazyme_table_merged)] + 0.001
+
+dab_plot_cazy = list()
+
+for (i in 1:nrow(maas_res_cazy)) {
+    tmp = ggplot(data = cazyme_table_merged) +
+    aes_string(x = "Fiber", y = maas_res_cazy$`Gene ID`[i], fill = "Country") +
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(position = position_jitterdodge(), size = .2, alpha = .2, color = "grey30") +
+    theme_bw() +
+    labs(x = NULL, y = "Reads per Kb per genome", title = stringr::str_wrap(string = maas_res_cazy$DIAMOND[i], width = 3)) +
+    scale_fill_manual(values = c("#BF0D3E", "steelblue")) +
+    annotate("text", x = Inf, y = Inf, label = bquote("q-value ="~.(formatC(maas_res_cazy$qval[i], format = "e", digits = 2))), hjust = 1.1, vjust = 3, size = 2) +
+    annotate("text", x = Inf, y = Inf, label = bquote("NONE vs."~.(maas_res_cazy$value[i])), hjust = 1.1, vjust = 2, size = 2) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), plot.title = element_text(size=7)) +
+    scale_y_log10()
+  
+  dab_plot_cazy[[length(dab_plot_cazy)+1]] = tmp
+}
+
+ggarrange(plotlist = dab_plot_cazy, common.legend = T, ncol = 5, nrow = 2, legend = "bottom")
+```
+
+Terminal electron acceptor stuff:
+```{r}
+electron_list = list(Cyt_C_Ox = eggnog_anots[grepl("cytochrome c oxidase", ignore.case = T, x = eggnog_anots$V8),], Nitr_Red = eggnog_anots[grepl("nitrate reductase", ignore.case = T, x = eggnog_anots$V8),], Ferr_Red = eggnog_anots[grepl("ferric reductase", ignore.case = T, x = eggnog_anots$V8),], Fum_Red =  eggnog_anots[grepl("fumarate reductase", ignore.case = T, x = eggnog_anots$V8),], Sulfite_Red = eggnog_anots[grepl("sulfite reductase", ignore.case = T, x = eggnog_anots$V8),], Het_sulf_Red = eggnog_anots[grepl("heterodisulfide reductase", ignore.case = T, x = eggnog_anots$V8),])
+
+for (i in 1:length(electron_list)) {
+  electron_list[[i]]$Type = names(electron_list)[i]
+  electron_list[[i]] = merge(electron_list[[i]], RPKG2, by.x = "V1", by.y = "row.names") %>% column_to_rownames(var = "V1")
+  electron_list[[i]][,22:ncol(electron_list[[i]])] = electron_list[[i]][,22:ncol(electron_list[[i]])] %>% select(alpha_df$Row.names) %>% select_if(~ !any(is.na(.))) %>% select(!which(colSums(.) == 0))
+}
+
+electron_plot = list()
+
+for (i in 1:length(electron_list)) {
+    tmp = as.data.frame(diversity(electron_list[[i]][,22:ncol(electron_list[[i]])], MARGIN = 2))
+    tmp$Type = names(electron_list)[i]
+    tmp = merge(tmp, metadata, by.x = "row.names", by.y = "Row.names")
+    electron_plot[[length(electron_plot)+1]] = tmp
+}
+
+electron_plot = bind_rows(electron_plot)
+names(electron_plot)[2] = "Shannon"
+
+electron_plot$Fiber = factor(electron_plot$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM"))
+
+ggplot(data = electron_plot[electron_plot$Row.names %in% alpha_df$Row.names,]) +
+  aes(x = Type, y = Shannon, fill = Country) +
+  geom_boxplot() +
+  geom_point(position = position_jitterdodge(jitter.width = .1), alpha = .25) +
+  facet_grid(Fiber+Time~., scales = "free", space = "free") +
+  theme_bw() +
+  scale_fill_manual(values = c("#BF0D3E", "steelblue")) +
+  labs(title = "Terminal electron acceptors", x = NULL, y = "Shannon index")
+```
+
+Taxa barplot using MAG taxonomy:
+```{r}
+full_taxonomy = rbind(bacterial_taxonomy, archaeal_taxonomy) %>% mutate(user_genome = gsub("_renamed", "", user_genome)) %>% select(user_genome, classification) %>% merge(., OTU_table, by.x = "user_genome", by.y = "row.names") %>% select(!user_genome) %>% column_to_rownames(var = "classification") %>% decostand(., method = "total", MARGIN = 2) %>% rownames_to_column(var = "classification")
+
+#Melt and separate taxonomy, remove whitespaces
+barplot_df = reshape2::melt(full_taxonomy) %>% mutate(classification = gsub(".__", "", .$classification)) %>% 
+  tidyr::separate(., col = classification, into = c("L1","L2","L3","L4","L5","L6","L7"), sep = ";", remove = T, extra = "drop") %>% 
+  mutate_all(na_if,"") %>% filter(.$variable %in% alpha_df$Row.names)
+
+barplot_df = rename(barplot_df, taxonomy = L5) %>% mutate(taxonomy = gsub("_.", "", .$taxonomy))
+
+#Take top 10
+top_taxa <- group_by(barplot_df, taxonomy) %>% summarise(., top_taxa_tmp = sum(value)) %>% arrange(., desc(top_taxa_tmp)) %>% slice(., 1:10)
+high_abundance <- split(top_taxa$taxonomy, 1:NROW(top_taxa))
+high_abundance <- high_abundance[!is.na(high_abundance)]
+
+#Replace not top 10 with other.
+barplot_df$taxonomy[barplot_df$taxonomy %in% high_abundance != "TRUE"] <- "Other"
+barplot_df2 <- aggregate(barplot_df$value, by=list(taxonomy=barplot_df$taxonomy, variable = barplot_df$variable), FUN=sum) %>% merge(., metadata, by.x = "variable", by.y = "Row.names")
+
+barplot_df2 <- barplot_df2[order(barplot_df2$taxonomy),] #Re order
+barplot_df2 <- rbind(barplot_df2[!(barplot_df2$taxonomy == "Other"),],barplot_df2[(barplot_df2$taxonomy == "Other"),]) #Move other to bottom
+barplot_df2$taxonomy <- factor(barplot_df2$taxonomy, levels = unique(barplot_df2$taxonomy)) #Fix the order
+
+barplot_df2 = barplot_df2 %>% filter(!(Fiber %in% c("INULIN", "PECTIN", "PSYLLIUM") & Time == "0"))
+barplot_df2$Fiber = factor(barplot_df2$Fiber, levels = c("NONE", "INULIN", "PECTIN", "PSYLLIUM"))
+barplot_df2 = barplot_df2 %>% filter(!variable %in% c("F28-2-00", "F20-2-00"))
+
+bp1 = ggplot(data = barplot_df2[barplot_df2$Country == "US",], aes(x = variable, weight = x, fill = taxonomy)) +
+  geom_bar() +
+  theme_classic(base_size = 16) +
+  facet_grid(Country~Subject+Time+Fiber, space = "free", scales = "free") + 
+  scale_fill_manual(values = Julio_color) +
+  theme(strip.background = element_blank(), strip.text = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), panel.spacing = unit(0, "lines")) +
+  labs(x = NULL,
+       y = "Relative abundance", fill = "Family") +
+  geom_text(data = barplot_df2[barplot_df2$Country == "US",] %>% select(!c(taxonomy,x)) %>% distinct(), inherit.aes = F, aes(x = variable, label = Subject), y = -0.03, size = 1.5, angle = 90, hjust = 1) +
+  geom_text(data = barplot_df2[barplot_df2$Country == "US",] %>% select(!c(taxonomy,x)) %>% distinct(), inherit.aes = F, aes(x = variable, label = Fiber), y = 1.05, size = 1, angle = 90, hjust = 1) +
+  geom_text(data = barplot_df2[barplot_df2$Country == "US",] %>% select(!c(taxonomy,x)) %>% distinct(), inherit.aes = F, aes(x = variable, label = Time), y = -0.01, size = 1.5, angle = 90, hjust = 1)
+bp1
+
+#ggsave(filename = "Bar_plot.png", plot = bp1, device = "png", width = 16, height = 8, units = "in", dpi = 600)
+
+bp2 = ggplot(data = barplot_df2[barplot_df2$Country == "Morocco",], aes(x = variable, weight = x, fill = taxonomy)) +
+  geom_bar() +
+  theme_classic(base_size = 16) +
+  facet_grid(Country~Subject+Time+Fiber, space = "free", scales = "free") + 
+  scale_fill_manual(values = Julio_color) +
+  theme(strip.background = element_blank(), strip.text = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), panel.spacing = unit(0, "lines")) +
+  labs(x = NULL,
+       y = "Relative abundance", fill = "Family") +
+  geom_text(data = barplot_df2[barplot_df2$Country == "Morocco",] %>% select(!c(taxonomy,x)) %>% distinct(), inherit.aes = F, aes(x = variable, label = Subject), y = -0.03, size = 1.5, angle = 90, hjust = 1) +
+  geom_text(data = barplot_df2[barplot_df2$Country == "Morocco",] %>% select(!c(taxonomy,x)) %>% distinct(), inherit.aes = F, aes(x = variable, label = Fiber), y = 1.05, size = 1, angle = 90, hjust = 1) +
+  geom_text(data = barplot_df2[barplot_df2$Country == "Morocco",] %>% select(!c(taxonomy,x)) %>% distinct(), inherit.aes = F, aes(x = variable, label = Time), y = -0.01, size = 1.5, angle = 90, hjust = 1)
+bp2
+
+ggsave(filename = "Bar_plot.png", plot = ggarrange(bp1, bp2, ncol = 1, labels = c("a.", "b."), common.legend = T, legend = "bottom"), device = "png", width = 12, height = 12, units = "in", dpi = 600, bg = "white")
+```
+
+```{r}
+fig4_top = ggarrange(country_volcano_plot, country_summ_plot, dab_sum_plot, nrow = 1, labels = c("a.", "b.", "c."), widths = c(1.5,1,1.75))
+fig4_bot = ggarrange(plotlist = dab_plot_both, common.legend = T, ncol = 5, nrow = 2, legend = "bottom")
+fig4_bot = annotate_figure(fig4_bot, top = text_grob("Top 10 most significantly different taxa per fiber - T24 only"))
+fig4 = ggarrange(fig4_top, fig4_bot, ncol = 1, labels = c("", "d."), heights = c(1,1.5))
+ggsave(filename = "Figure_4.png", plot = fig4, device = "png", dpi = 600, width = 15, height = 10, bg = "white")
+```
+
+```{r}
+fig5 = ggarrange(all_cazy_plot, pectin_cazy_plot, psyl_cazy_plot, nrow = 1, labels = c("a.", "b.", "c."))
+fig5 = annotate_figure(fig5, top = text_grob("Top 5 CAZyme families by microbe"))
+ggsave(filename = "Figure_5.png", plot = fig5, device = "png", dpi = 600, width = 16, height = 5, bg = "white")
+```
+
+To do:
+Pc_F27-3-24, Pc_F28-1-24, Pc_F28-2-24, Pc_F28-3-24, Pc_F30-1-24, Pc_F30-2-24, Pc_F30-3-24 are missing.  
+Phylogenetic tree. 
